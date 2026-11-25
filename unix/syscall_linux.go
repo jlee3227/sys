@@ -13,6 +13,7 @@ package unix
 
 import (
 	"encoding/binary"
+	"runtime"
 	"slices"
 	"strconv"
 	"syscall"
@@ -414,23 +415,32 @@ func (sa *SockaddrInet6) sockaddr() (unsafe.Pointer, _Socklen, error) {
 func (sa *SockaddrUnix) sockaddr() (unsafe.Pointer, _Socklen, error) {
 	name := sa.Name
 	n := len(name)
-	if n >= len(sa.raw.Path) {
+	if n > len(sa.raw.Path) {
+		return nil, 0, EINVAL
+	}
+	// Abstract addresses start with NUL.
+	// '@' is also a valid way to specify abstract addresses.
+	isAbstract := n > 0 && (name[0] == '@' || name[0] == '\x00')
+
+	// Non-abstract named addresses are NUL terminated.
+	// The length can't use the full capacity as we need to add NUL.
+	if n == len(sa.raw.Path) && !isAbstract {
 		return nil, 0, EINVAL
 	}
 	sa.raw.Family = AF_UNIX
 	for i := range n {
 		sa.raw.Path[i] = int8(name[i])
 	}
-	// length is family (uint16), name, NUL.
-	sl := _Socklen(2)
-	if n > 0 {
-		sl += _Socklen(n) + 1
-	}
-	if sa.raw.Path[0] == '@' || (sa.raw.Path[0] == 0 && sl > 3) {
-		// Check sl > 3 so we don't change unnamed socket behavior.
+	// Length is family + name (+ NUL if non-abstract).
+	// Family is of type uint16 (2 bytes).
+	sl := _Socklen(2 + n)
+	if isAbstract {
+		// Abstract addresses are not NUL terminated.
+		// We rewrite '@' prefix to NUL here.
 		sa.raw.Path[0] = 0
-		// Don't count trailing NUL for abstract address.
-		sl--
+	} else if n > 0 {
+		// Add NUL for non-abstract named addresses.
+		sl++
 	}
 
 	return unsafe.Pointer(&sa.raw), sl, nil
@@ -1991,7 +2001,24 @@ func FsconfigReconfigure(fd int) (err error) {
 	return fsconfig(fd, FSCONFIG_CMD_RECONFIGURE, nil, nil, 0)
 }
 
-//sys	Getdents(fd int, buf []byte) (n int, err error) = SYS_GETDENTS64
+//sys	getdents(fd int, buf []byte) (n int, err error) = SYS_GETDENTS64
+
+// Getdents reads directory entries from fd into buf.
+func Getdents(fd int, buf []byte) (n int, err error) {
+	// getdents64 stores d_ino with a 64-bit write, which faults on
+	// strict-alignment targets unless buf is 8-aligned.
+	if len(buf) > 0 {
+		if off := int(-uintptr(unsafe.Pointer(&buf[0])) & 7); off > 0 && off < len(buf) {
+			n, err = getdents(fd, buf[off:])
+			if n > 0 {
+				copy(buf, buf[off:off+n])
+			}
+			return n, err
+		}
+	}
+	return getdents(fd, buf)
+}
+
 //sysnb	Getpgid(pid int) (pgid int, err error)
 
 func Getpgrp() (pid int) {
@@ -2033,6 +2060,7 @@ func Getrandom(buf []byte, flags int) (n int, err error) {
 //sysnb	Kill(pid int, sig syscall.Signal) (err error)
 //sys	Klogctl(typ int, buf []byte) (n int, err error) = SYS_SYSLOG
 //sys	Lgetxattr(path string, attr string, dest []byte) (sz int, err error)
+//sys	Listns(req *NsIdReq, nsIds []uint64, flags uint) (n int, err error)
 //sys	Listxattr(path string, dest []byte) (sz int, err error)
 //sys	Llistxattr(path string, dest []byte) (sz int, err error)
 //sys	Lremovexattr(path string, attr string) (err error)
@@ -2046,6 +2074,7 @@ func Getrandom(buf []byte, flags int) (n int, err error) {
 //sys	PerfEventOpen(attr *PerfEventAttr, pid int, cpu int, groupFd int, flags int) (fd int, err error)
 //sys	PivotRoot(newroot string, putold string) (err error) = SYS_PIVOT_ROOT
 //sys	Prctl(option int, arg2 uintptr, arg3 uintptr, arg4 uintptr, arg5 uintptr) (err error)
+//sys	PrctlArg5Ptr(option int, arg2 uintptr, arg3 uintptr, arg4 uintptr, arg5 unsafe.Pointer) (err error) = SYS_PRCTL
 //sys	pselect6(nfd int, r *FdSet, w *FdSet, e *FdSet, timeout *Timespec, sigmask *sigset_argpack) (n int, err error)
 //sys	read(fd int, p []byte) (n int, err error)
 //sys	Removexattr(path string, attr string) (err error)
@@ -2251,8 +2280,17 @@ func Faccessat(dirfd int, path string, mode uint32, flags int) (err error) {
 		return faccessat(dirfd, path, mode)
 	}
 
-	if err := Faccessat2(dirfd, path, mode, flags); err != ENOSYS && err != EPERM {
-		return err
+	// Attempt to use the newer faccessat2, which supports flags directly,
+	// falling back if it doesn't exist.
+	//
+	// Don't attempt on Android, which does not allow faccessat2 through
+	// its seccomp policy [1] on any version of Android as of 2022-12-20.
+	//
+	// [1] https://cs.android.com/android/platform/superproject/+/master:bionic/libc/SECCOMP_BLOCKLIST_APP.TXT;l=4;drc=dbb8670dfdcc677f7e3b9262e93800fa14c4e417
+	if runtime.GOOS != "android" {
+		if err := Faccessat2(dirfd, path, mode, flags); err != ENOSYS && err != EPERM {
+			return err
+		}
 	}
 
 	// The Linux kernel faccessat system call does not take any flags.
@@ -2363,7 +2401,7 @@ func (fh *FileHandle) Bytes() []byte {
 	if n == 0 {
 		return nil
 	}
-	return unsafe.Slice((*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(&fh.fileHandle.Type))+4)), n)
+	return unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(&fh.fileHandle.Type), 4)), n)
 }
 
 // NameToHandleAt wraps the name_to_handle_at system call; it obtains
@@ -2565,10 +2603,13 @@ func SchedGetAttr(pid int, flags uint) (*SchedAttr, error) {
 
 //sys	setMemPolicy(mode int, mask unsafe.Pointer, size uintptr) (err error) = SYS_SET_MEMPOLICY
 
+// The maxnode argument of set_mempolicy(2) is the number of bits in the mask
+// plus one, as the kernel decrements it before use (as does libnuma).
+
 func SetMemPolicy(mode int, mask *CPUSet) error {
-	return setMemPolicy(mode, unsafe.Pointer(mask), _CPU_SETSIZE)
+	return setMemPolicy(mode, unsafe.Pointer(mask), _CPU_SETSIZE+1)
 }
 
 func SetMemPolicyDynamic(mode int, mask CPUSetDynamic) error {
-	return setMemPolicy(mode, mask.pointer(), mask.size())
+	return setMemPolicy(mode, mask.pointer(), uintptr(len(mask))*_NCPUBITS+1)
 }

@@ -1028,21 +1028,95 @@ func TestProcessModules(t *testing.T) {
 }
 
 func TestQueryWorkingSetEx(t *testing.T) {
-	var a int
+	// Map a few pages of shared memory and page them in.
+	pageSize := os.Getpagesize()
+	pageNum := 4
+	size := pageSize * pageNum
+	handle, err := windows.CreateFileMapping(windows.InvalidHandle, nil, windows.PAGE_READWRITE, 0, uint32(size), nil)
+	if err != nil {
+		t.Fatalf("CreateFileMapping failed: %v", err)
+	}
+	defer windows.CloseHandle(handle)
+	addr, err := windows.MapViewOfFile(handle, windows.FILE_MAP_WRITE, 0, 0, uintptr(size))
+	if err != nil {
+		t.Fatalf("MapViewOfFile failed: %v", err)
+	}
+	defer windows.UnmapViewOfFile(addr)
+	mem := unsafe.Slice((*byte)(unsafe.Pointer(addr)), size)
+	for i := range mem {
+		mem[i] = 1
+	}
 
+	// Query one page per call. PSAPI_WORKING_SET_EX_INFORMATION has the
+	// wrong size on 386 (golang/go#74493), so a multi-entry query is not
+	// reliable there.
 	process := windows.CurrentProcess()
-	information := windows.PSAPI_WORKING_SET_EX_INFORMATION{
-		VirtualAddress: windows.Pointer(unsafe.Pointer(&a)),
+	for i := 0; i < pageNum; i++ {
+		infos := []windows.PSAPI_WORKING_SET_EX_INFORMATION{
+			{VirtualAddress: windows.Pointer(unsafe.Pointer(addr + uintptr(i*pageSize)))},
+		}
+		cb := uint32(uintptr(len(infos)) * unsafe.Sizeof(infos[0]))
+		if err := windows.QueryWorkingSetEx(process, uintptr(unsafe.Pointer(&infos[0])), cb); err != nil {
+			t.Fatalf("QueryWorkingSetEx failed: %v", err)
+		}
+		attrs := infos[0].VirtualAttributes
+		if !attrs.Valid() {
+			t.Errorf("page %d: memory location not valid: attributes %#x", i, uint64(attrs))
+		}
+		if !attrs.Shared() {
+			t.Errorf("page %d: memory location not shared: attributes %#x", i, uint64(attrs))
+		}
 	}
-	infos := []windows.PSAPI_WORKING_SET_EX_INFORMATION{information}
+}
 
+func TestPSAPIWorkingSetExBlockBits(t *testing.T) {
+	tests := []struct {
+		name string
+		bit  uint
+		get  func(windows.PSAPI_WORKING_SET_EX_BLOCK) bool
+	}{
+		{"Valid", 0, windows.PSAPI_WORKING_SET_EX_BLOCK.Valid},
+		{"Shared", 15, windows.PSAPI_WORKING_SET_EX_BLOCK.Shared},
+		{"Locked", 22, windows.PSAPI_WORKING_SET_EX_BLOCK.Locked},
+		{"LargePage", 23, windows.PSAPI_WORKING_SET_EX_BLOCK.LargePage},
+		{"Bad", 31, windows.PSAPI_WORKING_SET_EX_BLOCK.Bad},
+	}
+	for _, tt := range tests {
+		set := windows.PSAPI_WORKING_SET_EX_BLOCK(1) << tt.bit
+		if !tt.get(set) {
+			t.Errorf("%s() = false with bit %d set", tt.name, tt.bit)
+		}
+		if tt.get(^set) {
+			t.Errorf("%s() = true with only bit %d clear", tt.name, tt.bit)
+		}
+	}
+}
+
+func TestQueryWorkingSetExLocked(t *testing.T) {
+	size := uintptr(os.Getpagesize())
+	addr, err := windows.VirtualAlloc(0, size, windows.MEM_COMMIT|windows.MEM_RESERVE, windows.PAGE_READWRITE)
+	if err != nil {
+		t.Fatalf("VirtualAlloc failed: %v", err)
+	}
+	defer windows.VirtualFree(addr, 0, windows.MEM_RELEASE)
+	if err := windows.VirtualLock(addr, size); err != nil {
+		t.Skipf("VirtualLock failed: %v", err)
+	}
+	defer windows.VirtualUnlock(addr, size)
+
+	infos := []windows.PSAPI_WORKING_SET_EX_INFORMATION{
+		{VirtualAddress: windows.Pointer(unsafe.Pointer(addr))},
+	}
 	cb := uint32(uintptr(len(infos)) * unsafe.Sizeof(infos[0]))
-	if err := windows.QueryWorkingSetEx(process, uintptr(unsafe.Pointer(&infos[0])), cb); err != nil {
-		t.Fatalf("%+v", err)
+	if err := windows.QueryWorkingSetEx(windows.CurrentProcess(), uintptr(unsafe.Pointer(&infos[0])), cb); err != nil {
+		t.Fatalf("QueryWorkingSetEx failed: %v", err)
 	}
-
-	if !infos[0].VirtualAttributes.Valid() {
-		t.Errorf("memory location not valid")
+	attrs := infos[0].VirtualAttributes
+	if !attrs.Valid() {
+		t.Fatalf("locked page is not valid: attributes %#x", uint64(attrs))
+	}
+	if !attrs.Locked() {
+		t.Errorf("locked page is not reported as locked: attributes %#x", uint64(attrs))
 	}
 }
 
@@ -1070,6 +1144,73 @@ func TestReadWriteProcessMemory(t *testing.T) {
 	}
 	if !bytes.Equal(testBuffer, buffer) {
 		t.Errorf("bytes written does not match buffer: 0x%X != 0x%X", testBuffer, buffer)
+	}
+}
+
+func TestVirtualProtect(t *testing.T) {
+	testBuffer := []byte{0xBA, 0xAD, 0xF0, 0x0D}
+	memBasicInfo := windows.MemoryBasicInformation{}
+	err := windows.VirtualQuery(uintptr(unsafe.Pointer(&testBuffer[0])), &memBasicInfo, unsafe.Sizeof(memBasicInfo))
+	if err != nil {
+		t.Fatalf("VirtualQuery failed: %v", err)
+	}
+	origProtect := memBasicInfo.Protect
+	var oldProtect uint32
+	var newProtect uint32 = windows.PAGE_EXECUTE_READWRITE // Binary will crash if you remove read-write permissions, so add execute instead.
+	err = windows.VirtualProtect(uintptr(unsafe.Pointer(&testBuffer[0])), uintptr(len(testBuffer)), newProtect, &oldProtect)
+	if err != nil {
+		t.Fatalf("VirtualProtect failed: %v", err)
+	}
+	if origProtect != oldProtect {
+		t.Errorf("VirtualQuery Protect does not match oldProtect: 0x%X != 0x%X", origProtect, oldProtect)
+	}
+	err = windows.VirtualQuery(uintptr(unsafe.Pointer(&testBuffer[0])), &memBasicInfo, unsafe.Sizeof(memBasicInfo))
+	if err != nil {
+		t.Errorf("VirtualQuery failed: %v", err)
+	}
+	if memBasicInfo.Protect != newProtect {
+		t.Errorf("VirtualQuery Protect does not match newProtect: 0x%X != 0x%X", memBasicInfo.Protect, newProtect)
+	}
+	// Restore state
+	newProtect = oldProtect
+	err = windows.VirtualProtect(uintptr(unsafe.Pointer(&testBuffer[0])), uintptr(len(testBuffer)), newProtect, &oldProtect)
+	if err != nil {
+		t.Fatalf("VirtualProtect failed during restore: %v", err)
+	}
+}
+func TestVirtualProtectEx(t *testing.T) {
+	testBuffer := []byte{0xBA, 0xAD, 0xF0, 0x0D}
+	process, err := windows.GetCurrentProcess()
+	if err != nil {
+		t.Fatalf("unable to get current process: %v", err)
+	}
+	memBasicInfo := windows.MemoryBasicInformation{}
+	err = windows.VirtualQueryEx(process, uintptr(unsafe.Pointer(&testBuffer[0])), &memBasicInfo, unsafe.Sizeof(memBasicInfo))
+	if err != nil {
+		t.Fatalf("VirtualQueryEx failed: %v", err)
+	}
+	origProtect := memBasicInfo.Protect
+	var oldProtect uint32
+	var newProtect uint32 = windows.PAGE_EXECUTE_READWRITE // Binary will crash if you remove read-write permissions, so add execute instead.
+	err = windows.VirtualProtectEx(process, uintptr(unsafe.Pointer(&testBuffer[0])), uintptr(len(testBuffer)), newProtect, &oldProtect)
+	if err != nil {
+		t.Fatalf("VirtualProtectEx failed: %v", err)
+	}
+	if origProtect != oldProtect {
+		t.Errorf("VirtualQueryEx Protect does not match oldProtect: 0x%X != 0x%X", origProtect, oldProtect)
+	}
+	err = windows.VirtualQueryEx(process, uintptr(unsafe.Pointer(&testBuffer[0])), &memBasicInfo, unsafe.Sizeof(memBasicInfo))
+	if err != nil {
+		t.Errorf("VirtualQueryEx failed: %v", err)
+	}
+	if memBasicInfo.Protect != newProtect {
+		t.Errorf("VirtualQueryEx Protect does not match newProtect: 0x%X != 0x%X", memBasicInfo.Protect, newProtect)
+	}
+	// Restore state
+	newProtect = oldProtect
+	err = windows.VirtualProtectEx(process, uintptr(unsafe.Pointer(&testBuffer[0])), uintptr(len(testBuffer)), newProtect, &oldProtect)
+	if err != nil {
+		t.Fatalf("VirtualProtectEx failed during restore: %v", err)
 	}
 }
 
@@ -1473,7 +1614,7 @@ func TestToUnicodeEx(t *testing.T) {
 		t.Errorf("ToUnicodeEx failed, wanted 1, got %d", ret)
 	}
 	if utf16Buf[0] != 'ش' {
-		t.Errorf("ToUnicodeEx failed, wanted 'ش', got %q", utf16Buf[0])
+		t.Errorf("ToUnicodeEx failed, wanted 'ش', got %q", rune(utf16Buf[0]))
 	}
 	if err := windows.UnloadKeyboardLayout(araLayout); err != nil {
 		t.Errorf("UnloadKeyboardLayout failed: %v", err)

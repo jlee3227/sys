@@ -141,6 +141,108 @@ func TestIoctlRetInt(t *testing.T) {
 	}
 }
 
+func TestListns(t *testing.T) {
+	callListns := func(tb testing.TB, req *unix.NsIdReq, nsIDs []uint64, flags uint, context string) int {
+		tb.Helper()
+		n, err := unix.Listns(req, nsIDs, flags)
+		if err != nil {
+			if errors.Is(err, unix.ENOSYS) {
+				tb.Skip("listns syscall is not available (need Linux >= 6.19), skipping test")
+			}
+			if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+				tb.Skipf("listns requires additional privileges in this environment, skipping test: %v", err)
+			}
+			tb.Fatalf("%s: Listns failed: %v", context, err)
+		}
+		if n < 0 || n > len(nsIDs) {
+			tb.Fatalf("%s: Listns returned unexpected count %d, want [0, %d]", context, n, len(nsIDs))
+		}
+		return n
+	}
+
+	t.Run("all namespaces", func(t *testing.T) {
+		req := &unix.NsIdReq{
+			Size:       unix.NS_ID_REQ_SIZE_VER0,
+			Ns_id:      0,
+			Ns_type:    0,
+			User_ns_id: 0,
+		}
+		ids := make([]uint64, 64)
+		callListns(t, req, ids, 0, "all namespaces")
+	})
+
+	t.Run("network namespaces only", func(t *testing.T) {
+		req := &unix.NsIdReq{
+			Size:       unix.NS_ID_REQ_SIZE_VER0,
+			Ns_id:      0,
+			Ns_type:    uint32(unix.NET_NS),
+			User_ns_id: 0,
+		}
+		ids := make([]uint64, 64)
+		callListns(t, req, ids, 0, "network namespaces only")
+	})
+
+	t.Run("current user namespace owner", func(t *testing.T) {
+		req := &unix.NsIdReq{
+			Size:       unix.NS_ID_REQ_SIZE_VER0,
+			Ns_id:      0,
+			Ns_type:    0,
+			User_ns_id: unix.LISTNS_CURRENT_USER,
+		}
+		ids := make([]uint64, 64)
+		callListns(t, req, ids, 0, "current user namespace owner")
+	})
+
+	t.Run("network and mount namespaces", func(t *testing.T) {
+		req := &unix.NsIdReq{
+			Size:       unix.NS_ID_REQ_SIZE_VER0,
+			Ns_id:      0,
+			Ns_type:    uint32(unix.NET_NS | unix.MNT_NS),
+			User_ns_id: 0,
+		}
+		ids := make([]uint64, 64)
+		callListns(t, req, ids, 0, "network and mount namespaces")
+	})
+
+	t.Run("pagination via ns_id", func(t *testing.T) {
+		const pageSize = 10
+		req := &unix.NsIdReq{
+			Size:       unix.NS_ID_REQ_SIZE_VER0,
+			Ns_id:      0,
+			Ns_type:    0,
+			User_ns_id: 0,
+		}
+		ids := make([]uint64, pageSize)
+
+		total := 0
+		for {
+			n := callListns(t, req, ids, 0, "pagination")
+			if n == 0 {
+				break
+			}
+
+			// Continue from the last seen namespace ID.
+			last := ids[n-1]
+			if last == req.Ns_id {
+				t.Fatalf("pagination did not advance: last=%d", last)
+			}
+			total += n
+			req.Ns_id = last
+
+			// Partial batch means we've exhausted all results.
+			if n < pageSize {
+				break
+			}
+		}
+
+		t.Logf("total ns: %d", total)
+		if total == 0 {
+			t.Fatalf("pagination should return at least one namespace")
+		}
+	})
+
+}
+
 func TestIoctlGetRTCTime(t *testing.T) {
 	f, err := os.Open("/dev/rtc0")
 	if err != nil {
@@ -282,6 +384,19 @@ func TestPidfd(t *testing.T) {
 		t.Fatalf("failed to open child pidfd: %v", err)
 	}
 	defer unix.Close(fd)
+
+	info := unix.PidfdInfo{
+		Mask: unix.PIDFD_INFO_PID,
+	}
+	if err := unix.IoctlPidfdInfo(fd, &info); err != nil {
+		if err != unix.ENOSYS && err != unix.ENOTTY && err != unix.EINVAL {
+			t.Errorf("PIDFD_INFO_PID ioctl failed: %v", err)
+		}
+	} else {
+		if int(info.Pid) != cmd.Process.Pid {
+			t.Errorf("got pid %d, want %d", info.Pid, cmd.Process.Pid)
+		}
+	}
 
 	// Child is running but not terminated.
 	if err := unix.Waitid(unix.P_PIDFD, fd, nil, unix.WEXITED|unix.WNOHANG, nil); err != nil {
@@ -681,6 +796,76 @@ func TestSchedSetaffinityDynamic(t *testing.T) {
 	}
 }
 
+func TestSetMemPolicy(t *testing.T) {
+	const maxnodes = 1024
+
+	getMemPolicy := func(mask unix.CPUSetDynamic, flags uintptr) (int, error) {
+		var mode int32
+		bits := uintptr(len(mask)) * unsafe.Sizeof(mask[0]) * 8
+		_, _, e := unix.Syscall6(unix.SYS_GET_MEMPOLICY, uintptr(unsafe.Pointer(&mode)), uintptr(unsafe.Pointer(&mask[0])), bits, 0, flags, 0)
+		if e != 0 {
+			return 0, e
+		}
+		return int(mode), nil
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	allowed := unix.NewCPUSet(maxnodes)
+	if _, err := getMemPolicy(allowed, unix.MPOL_F_MEMS_ALLOWED); err != nil {
+		t.Skipf("get_mempolicy: %v", err)
+	}
+	// Use the highest allowed node to check that the whole mask is passed.
+	node := -1
+	for i := range maxnodes {
+		if allowed.IsSet(i) {
+			node = i
+		}
+	}
+	if node == -1 {
+		t.Skip("no allowed NUMA nodes")
+	}
+	t.Logf("using NUMA node %d", node)
+
+	// Memory policy is per-thread, so no subtests here.
+	defer func() {
+		if err := unix.SetMemPolicy(unix.MPOL_DEFAULT, nil); err != nil {
+			t.Fatalf("SetMemPolicy(MPOL_DEFAULT): %v", err)
+		}
+	}()
+
+	check := func(name string) {
+		got := unix.NewCPUSet(maxnodes)
+		mode, err := getMemPolicy(got, 0)
+		if err != nil {
+			t.Fatalf("%s: get_mempolicy: %v", name, err)
+		}
+		if mode != unix.MPOL_BIND {
+			t.Errorf("%s: got mode %d, want %d (MPOL_BIND)", name, mode, unix.MPOL_BIND)
+		}
+		if got.Count() != 1 || !got.IsSet(node) {
+			t.Errorf("%s: got node mask %v, want only node %d set", name, got, node)
+		}
+	}
+
+	var mask unix.CPUSet
+	mask.Set(node)
+	if err := unix.SetMemPolicy(unix.MPOL_BIND, &mask); err != nil {
+		t.Errorf("SetMemPolicy: %v", err)
+	} else {
+		check("SetMemPolicy")
+	}
+
+	maskDyn := unix.NewCPUSet(node + 1)
+	maskDyn.Set(node)
+	if err := unix.SetMemPolicyDynamic(unix.MPOL_BIND, maskDyn); err != nil {
+		t.Errorf("SetMemPolicyDynamic: %v", err)
+	} else {
+		check("SetMemPolicyDynamic")
+	}
+}
+
 func TestStatx(t *testing.T) {
 	var stx unix.Statx_t
 	err := unix.Statx(unix.AT_FDCWD, ".", 0, 0, &stx)
@@ -1061,6 +1246,19 @@ func TestPrctlRetInt(t *testing.T) {
 	}
 }
 
+func TestPrctlArg5Ptr(t *testing.T) {
+	var cookie uint64
+	err := unix.PrctlArg5Ptr(unix.PR_SCHED_CORE, unix.PR_SCHED_CORE_GET, 0, unix.PR_SCHED_CORE_SCOPE_THREAD, unsafe.Pointer(&cookie))
+	if err != nil {
+		if err == unix.ENOSYS || err == unix.EINVAL || err == unix.ENODEV {
+			t.Skip("PR_SCHED_CORE/PR_SCHED_CORE_GET not available")
+		}
+		t.Errorf("PR_SCHED_CORE/PR_SCHED_CORE_GET failed: %v", err)
+	} else {
+		t.Logf("CPU scheduling cookie %#x", cookie)
+	}
+}
+
 func TestTimerfd(t *testing.T) {
 	var now unix.Timespec
 	if err := unix.ClockGettime(unix.CLOCK_REALTIME, &now); err != nil {
@@ -1175,7 +1373,7 @@ func TestIoctlFileDedupeRange(t *testing.T) {
 	// Test deduplication with two blocks of zeros
 	data := make([]byte, 4096)
 
-	for i := 0; i < 2; i += 1 {
+	for range 2 {
 		_, err = f1.Write(data)
 		if err != nil {
 			t.Fatal(err)
@@ -1188,7 +1386,7 @@ func TestIoctlFileDedupeRange(t *testing.T) {
 	}
 	defer f2.Close()
 
-	for i := 0; i < 2; i += 1 {
+	for i := range 2 {
 		// Make the 2nd block different
 		if i == 1 {
 			data[1] = 1
